@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 FALLBACK_CHARSET: Final = "utf-8"
 UNNAMED_ATTACHMENT: Final = "attachment"
 
+# Inline parts below this are signature logos and tracking pixels, not documents
+# anyone wants forwarded. Inline parts at or above it are real embedded files.
+INLINE_MIN_BYTES: Final = 16 * 1024
+
 _WHITESPACE = re.compile(r"\s+")
 _BLANK_LINES = re.compile(r"\n{3,}")
 _UNSAFE_FILENAME = re.compile(r"[\x00-\x1f\x7f<>:\"|?*\\/]")
@@ -180,6 +184,9 @@ def _attachments(message: Message) -> list[Attachment]:
         payload = part.get_payload(decode=True)
         if not isinstance(payload, bytes):
             continue
+        if _is_inline(part) and len(payload) < INLINE_MIN_BYTES:
+            logger.debug("skipping a %d byte inline part", len(payload))
+            continue
         found.append(
             Attachment(
                 filename=safe_filename(part.get_filename()),
@@ -188,6 +195,13 @@ def _attachments(message: Message) -> list[Attachment]:
             )
         )
     return found
+
+
+def _is_inline(part: Message) -> bool:
+    disposition = (part.get_content_disposition() or "").lower()
+    if disposition == "inline":
+        return True
+    return not disposition and bool(part.get("Content-ID"))
 
 
 def _is_attachment(part: Message) -> bool:

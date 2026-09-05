@@ -9,8 +9,15 @@ from mailbridge.config import Config, ConfigError, load_config
 from mailbridge.database import Database, DatabaseError, MessageKey, Status
 from mailbridge.imap import ImapError
 from mailbridge.log import setup_logging
-from mailbridge.parser import Email, parse
-from mailbridge.telegram import TelegramClient, TelegramError, format_email
+from mailbridge.parser import Attachment, Email, parse
+from mailbridge.telegram import (
+    MAX_UPLOAD_BYTES,
+    TelegramClient,
+    TelegramError,
+    escape,
+    format_email,
+    format_size,
+)
 
 logger = logging.getLogger("mailbridge")
 
@@ -151,6 +158,38 @@ def _pass(config: Config, db: Database, *, limit: int, dry_run: bool) -> int:
             else:
                 db.mark_sent(key, sent_ids[0] if sent_ids else None)
                 logger.info("uid %d delivered as %d telegram message(s)", key.uid, len(sent_ids))
+                # The email is delivered; an attachment problem must not undo that.
+                _send_attachments(telegram, email.attachments, key.uid)
 
     logger.info("forwarded %d, skipped %d, failed %d", len(pending) - failures, skipped, failures)
     return EXIT_FAILURE if failures else EXIT_OK
+
+
+def _send_attachments(
+    telegram: TelegramClient, attachments: tuple[Attachment, ...], uid: int
+) -> None:
+    for attachment in attachments:
+        if attachment.size > MAX_UPLOAD_BYTES:
+            # Already flagged in the message body; nothing to upload.
+            logger.warning(
+                "uid %d: %s is %s, above the upload limit",
+                uid,
+                attachment.filename,
+                format_size(attachment.size),
+            )
+            continue
+
+        try:
+            telegram.send_document(attachment.filename, attachment.payload, attachment.content_type)
+        except TelegramError as error:
+            logger.error("uid %d: could not upload %s: %s", uid, attachment.filename, error)
+            _note_upload_failure(telegram, attachment.filename, str(error))
+        else:
+            logger.info("uid %d: uploaded %s", uid, attachment.filename)
+
+
+def _note_upload_failure(telegram: TelegramClient, filename: str, reason: str) -> None:
+    try:
+        telegram.send_message(f"⚠️ Could not upload {escape(filename)}: {escape(reason)}")
+    except TelegramError as error:
+        logger.error("could not report the failed upload of %s: %s", filename, error)

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from mailbridge.parser import (
+    INLINE_MIN_BYTES,
     Email,
     decode_mime_header,
     html_to_text,
@@ -200,3 +201,27 @@ class TestHtmlToText:
 
     def test_unclosed_tags_do_not_raise(self) -> None:
         assert "text" in html_to_text("<div><p>text")
+
+
+class TestInlineParts:
+    def test_a_small_inline_logo_is_dropped(self) -> None:
+        names = [a.filename for a in load("inline_images.eml").attachments]
+
+        assert "signature-logo.png" not in names
+
+    def test_a_large_inline_image_is_kept(self) -> None:
+        names = [a.filename for a in load("inline_images.eml").attachments]
+
+        assert names == ["holiday-photo.png"]
+
+    def test_inline_parts_never_become_the_body(self) -> None:
+        assert load("inline_images.eml").body == "See the photo below."
+
+    def test_a_small_explicit_attachment_survives(self) -> None:
+        attachments = load("small_attachment.eml").attachments
+
+        assert [a.filename for a in attachments] == ["tiny.csv"]
+        assert attachments[0].size < INLINE_MIN_BYTES
+
+    def test_the_threshold_is_the_boundary(self) -> None:
+        assert INLINE_MIN_BYTES == 16 * 1024

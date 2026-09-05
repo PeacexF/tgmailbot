@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -53,10 +54,18 @@ def config(tmp_path: Path) -> Config:
 class FakeTelegram:
     instances: ClassVar[list[FakeTelegram]] = []
 
-    def __init__(self, *args: Any, fail_on: set[str] | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        fail_on: set[str] | None = None,
+        reject_uploads: set[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
         self.sent: list[str] = []
+        self.uploaded: list[tuple[str, bytes]] = []
         self.closed = False
         self._fail_on = fail_on or set()
+        self._reject_uploads = reject_uploads or set()
         FakeTelegram.instances.append(self)
 
     def __enter__(self) -> FakeTelegram:
@@ -76,6 +85,14 @@ class FakeTelegram:
 
     def send_text(self, text: str) -> list[int]:
         return [self.send_message(text)]
+
+    def send_document(
+        self, filename: str, content: bytes, content_type: str, caption: str = ""
+    ) -> int:
+        if filename in self._reject_uploads:
+            raise TelegramError("upload rejected by the API")
+        self.uploaded.append((filename, content))
+        return 2000 + len(self.uploaded)
 
 
 @pytest.fixture
@@ -391,3 +408,136 @@ class TestCrashRecovery:
 
         total = sum(len(instance.sent) for instance in telegram.instances)
         assert total == 1
+
+
+def eml_with_attachment(filename: str = "invoice.pdf", payload: bytes = b"Hello world!") -> bytes:
+    encoded = base64.b64encode(payload).decode()
+    return (
+        "From: John Doe <john@example.com>\r\n"
+        "To: user@mail.ru\r\n"
+        "Subject: With attachment\r\n"
+        "Date: Fri, 5 Sep 2026 12:41:00 +0300\r\n"
+        "Message-ID: <att@example.com>\r\n"
+        'Content-Type: multipart/mixed; boundary="MIX"\r\n'
+        "\r\n"
+        "--MIX\r\n"
+        'Content-Type: text/plain; charset="utf-8"\r\n'
+        "\r\n"
+        "See attached.\r\n"
+        "\r\n"
+        "--MIX\r\n"
+        f'Content-Type: application/pdf; name="{filename}"\r\n'
+        f'Content-Disposition: attachment; filename="{filename}"\r\n'
+        "Content-Transfer-Encoding: base64\r\n"
+        "\r\n"
+        f"{encoded}\r\n"
+        "\r\n"
+        "--MIX--\r\n"
+    ).encode()
+
+
+class TestAttachments:
+    def test_an_attachment_is_uploaded_after_the_body(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        mailbox(FakeClient([1], bodies={1: eml_with_attachment()}))
+
+        assert run_once(config, limit=10) == EXIT_OK
+
+        client = telegram.instances[0]
+        assert len(client.sent) == 1
+        assert client.uploaded == [("invoice.pdf", b"Hello world!")]
+
+    def test_every_attachment_is_uploaded(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        raw = eml_with_attachment().replace(
+            b"--MIX--",
+            b'--MIX\r\nContent-Type: text/plain; name="notes.txt"\r\n'
+            b'Content-Disposition: attachment; filename="notes.txt"\r\n\r\n'
+            b"some notes\r\n\r\n--MIX--",
+        )
+        mailbox(FakeClient([1], bodies={1: raw}))
+
+        run_once(config, limit=10)
+
+        assert [name for name, _ in telegram.instances[0].uploaded] == [
+            "invoice.pdf",
+            "notes.txt",
+        ]
+
+    def test_an_oversized_attachment_is_not_uploaded(
+        self,
+        config: Config,
+        mailbox: Any,
+        telegram: type[FakeTelegram],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("mailbridge.main.MAX_UPLOAD_BYTES", 4)
+        mailbox(FakeClient([1], bodies={1: eml_with_attachment(payload=b"much too large")}))
+
+        assert run_once(config, limit=10) == EXIT_OK
+        assert telegram.instances[0].uploaded == []
+
+    def test_the_email_is_still_delivered_when_an_upload_fails(
+        self, config: Config, mailbox: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        FakeTelegram.instances = []
+        monkeypatch.setattr(
+            "mailbridge.main.TelegramClient",
+            lambda *args, **kwargs: FakeTelegram(reject_uploads={"invoice.pdf"}),
+        )
+        mailbox(FakeClient([1], bodies={1: eml_with_attachment()}))
+
+        assert run_once(config, limit=10) == EXIT_OK
+
+        client = FakeTelegram.instances[0]
+        assert "See attached." in client.sent[0]
+        with connect(config.database_path) as db:
+            assert db.status_of(MessageKey(config.mail_username, 42, 1)) is Status.SENT
+
+    def test_a_failed_upload_is_reported_in_the_thread(
+        self, config: Config, mailbox: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        FakeTelegram.instances = []
+        monkeypatch.setattr(
+            "mailbridge.main.TelegramClient",
+            lambda *args, **kwargs: FakeTelegram(reject_uploads={"invoice.pdf"}),
+        )
+        mailbox(FakeClient([1], bodies={1: eml_with_attachment()}))
+
+        run_once(config, limit=10)
+
+        assert any(
+            "Could not upload invoice.pdf" in message for message in FakeTelegram.instances[0].sent
+        )
+
+    def test_one_failed_upload_does_not_block_the_next(
+        self, config: Config, mailbox: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = eml_with_attachment().replace(
+            b"--MIX--",
+            b'--MIX\r\nContent-Type: text/plain; name="notes.txt"\r\n'
+            b'Content-Disposition: attachment; filename="notes.txt"\r\n\r\n'
+            b"some notes\r\n\r\n--MIX--",
+        )
+        FakeTelegram.instances = []
+        monkeypatch.setattr(
+            "mailbridge.main.TelegramClient",
+            lambda *args, **kwargs: FakeTelegram(reject_uploads={"invoice.pdf"}),
+        )
+        mailbox(FakeClient([1], bodies={1: raw}))
+
+        run_once(config, limit=10)
+
+        assert [name for name, _ in FakeTelegram.instances[0].uploaded] == ["notes.txt"]
+
+    def test_attachments_are_not_re_uploaded_on_a_second_pass(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        mailbox(FakeClient([1], bodies={1: eml_with_attachment()}))
+        run_once(config, limit=10)
+        run_once(config, limit=10)
+
+        assert len(telegram.instances) == 1
+        assert len(telegram.instances[0].uploaded) == 1

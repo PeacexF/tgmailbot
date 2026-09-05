@@ -1,0 +1,19 @@
+From: Reports <reports@example.com>
+To: user@mail.ru
+Subject: Tiny csv
+Date: Mon, 8 Jun 2026 10:00:00 +0000
+Content-Type: multipart/mixed; boundary="MIX"
+
+--MIX
+Content-Type: text/plain; charset="utf-8"
+
+Attached.
+
+--MIX
+Content-Type: text/csv; name="tiny.csv"
+Content-Disposition: attachment; filename="tiny.csv"
+Content-Transfer-Encoding: base64
+
+aWQsbmFtZQoxLG9rCg==
+
+--MIX--

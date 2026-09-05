@@ -12,7 +12,9 @@ import pytest
 from mailbridge.config import Secret
 from mailbridge.parser import Attachment, Email
 from mailbridge.telegram import (
+    CAPTION_LIMIT,
     MAX_MESSAGE_LENGTH,
+    MAX_UPLOAD_BYTES,
     TelegramClient,
     TelegramError,
     escape,
@@ -329,3 +331,114 @@ class TestSendText:
             client.send_text("hello")
 
         assert body_of(seen[0])["parse_mode"] == "HTML"
+
+
+class TestSendDocument:
+    def test_returns_the_message_id(self) -> None:
+        client, _ = make_client(ok({"message_id": 88}))
+
+        with client:
+            assert client.send_document("a.pdf", b"data", "application/pdf") == 88
+
+    def test_targets_the_send_document_endpoint(self) -> None:
+        client, seen = make_client(ok({"message_id": 1}))
+
+        with client:
+            client.send_document("a.pdf", b"data", "application/pdf")
+
+        assert seen[0].url.path.endswith("/sendDocument")
+
+    def test_uploads_as_multipart_with_the_filename(self) -> None:
+        client, seen = make_client(ok({"message_id": 1}))
+
+        with client:
+            client.send_document("invoice.pdf", b"pdf-bytes", "application/pdf")
+
+        content_type = seen[0].headers["content-type"]
+        assert content_type.startswith("multipart/form-data")
+        assert b'filename="invoice.pdf"' in seen[0].content
+        assert b"pdf-bytes" in seen[0].content
+
+    def test_sends_the_chat_id(self) -> None:
+        client, seen = make_client(ok({"message_id": 1}))
+
+        with client:
+            client.send_document("a.pdf", b"data", "application/pdf")
+
+        assert CHAT_ID.encode() in seen[0].content
+
+    def test_a_caption_is_included_when_given(self) -> None:
+        client, seen = make_client(ok({"message_id": 1}))
+
+        with client:
+            client.send_document("a.pdf", b"data", "application/pdf", caption="hello")
+
+        assert b"hello" in seen[0].content
+
+    def test_no_caption_field_when_empty(self) -> None:
+        client, seen = make_client(ok({"message_id": 1}))
+
+        with client:
+            client.send_document("a.pdf", b"data", "application/pdf")
+
+        assert b'name="caption"' not in seen[0].content
+
+    def test_a_long_caption_is_truncated(self) -> None:
+        client, seen = make_client(ok({"message_id": 1}))
+
+        with client:
+            client.send_document("a.pdf", b"d", "application/pdf", caption="x" * 2000)
+
+        assert seen[0].content.count(b"x") == CAPTION_LIMIT
+
+    def test_an_oversized_upload_is_refused_without_a_request(self) -> None:
+        client, seen = make_client(ok({"message_id": 1}))
+
+        with client, pytest.raises(TelegramError, match="upload limit"):
+            client.send_document("huge.zip", b"x" * (MAX_UPLOAD_BYTES + 1), "application/zip")
+
+        assert seen == []
+
+    def test_a_file_at_the_limit_is_accepted(self) -> None:
+        client, seen = make_client(ok({"message_id": 1}))
+
+        with client:
+            client.send_document("big.zip", b"x" * MAX_UPLOAD_BYTES, "application/zip")
+
+        assert len(seen) == 1
+
+    def test_an_api_error_surfaces(self) -> None:
+        client, _ = make_client(
+            lambda request: httpx.Response(413, json={"ok": False, "description": "too big"})
+        )
+
+        with client, pytest.raises(TelegramError, match="too big"):
+            client.send_document("a.pdf", b"data", "application/pdf")
+
+    def test_missing_message_id_is_an_error(self) -> None:
+        client, _ = make_client(ok({}))
+
+        with client, pytest.raises(TelegramError, match="message_id"):
+            client.send_document("a.pdf", b"data", "application/pdf")
+
+
+class TestOversizedAttachmentNote:
+    def test_an_oversized_attachment_is_flagged_in_the_body(self) -> None:
+        rendered = format_email(
+            replace(
+                SAMPLE,
+                attachments=(
+                    Attachment("huge.zip", "application/zip", b"x" * (MAX_UPLOAD_BYTES + 1)),
+                ),
+            )
+        )
+
+        assert "too large to upload" in rendered
+        assert "huge.zip" in rendered
+
+    def test_a_normal_attachment_is_not_flagged(self) -> None:
+        rendered = format_email(
+            replace(SAMPLE, attachments=(Attachment("ok.pdf", "application/pdf", b"x" * 100),))
+        )
+
+        assert "too large" not in rendered

@@ -7,7 +7,7 @@ from typing import Any, Final, Self
 import httpx
 
 from mailbridge.config import Secret
-from mailbridge.parser import Email
+from mailbridge.parser import Attachment, Email
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +18,11 @@ DEFAULT_TIMEOUT: Final = 30.0
 # HTML needs three characters escaped; MarkdownV2 needs eighteen, and an email
 # subject is free to contain all of them.
 PARSE_MODE: Final = "HTML"
+
+# The cloud Bot API accepts uploads up to 50 MB; only a self-hosted API server
+# raises that. Anything larger is reported in the message instead of uploaded.
+MAX_UPLOAD_BYTES: Final = 50 * 1024 * 1024
+CAPTION_LIMIT: Final = 1024
 
 
 class TelegramError(Exception):
@@ -85,9 +90,36 @@ class TelegramClient:
         """Send text as however many messages Telegram's size limit requires."""
         return [self.send_message(chunk) for chunk in split_text(text)]
 
+    def send_document(
+        self, filename: str, content: bytes, content_type: str, caption: str = ""
+    ) -> int:
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise TelegramError(
+                f"{filename} is {format_size(len(content))}, above the"
+                f" {format_size(MAX_UPLOAD_BYTES)} upload limit"
+            )
+
+        data = {"chat_id": self._chat_id}
+        if caption:
+            data["caption"] = caption[:CAPTION_LIMIT]
+            data["parse_mode"] = PARSE_MODE
+
+        result = self._request(
+            "sendDocument",
+            data=data,
+            files={"document": (filename, content, content_type)},
+        )
+        message_id = result.get("message_id")
+        if not isinstance(message_id, int):
+            raise TelegramError("sendDocument returned no message_id")
+        return message_id
+
     def _post(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request(method, json=payload)
+
+    def _request(self, method: str, **kwargs: Any) -> dict[str, Any]:
         try:
-            response = self._http.post(f"/{method}", json=payload)
+            response = self._http.post(f"/{method}", **kwargs)
         except httpx.HTTPError as error:
             raise TelegramError(f"{method} request failed: {self._scrub(str(error))}") from error
         return self._unwrap(method, response)
@@ -140,8 +172,15 @@ def format_email(email: Email) -> str:
 
     if email.attachments:
         lines.append("")
-        lines += [f"📎 {escape(a.filename)} ({format_size(a.size)})" for a in email.attachments]
+        lines += [_attachment_line(a) for a in email.attachments]
     return "\n".join(lines)
+
+
+def _attachment_line(attachment: Attachment) -> str:
+    line = f"📎 {escape(attachment.filename)} ({format_size(attachment.size)})"
+    if attachment.size > MAX_UPLOAD_BYTES:
+        line += " — too large to upload"
+    return line
 
 
 def format_size(size: int) -> str:
