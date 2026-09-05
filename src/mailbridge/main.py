@@ -4,14 +4,19 @@ import argparse
 import logging
 from collections.abc import Sequence
 
-from mailbridge import __version__
-from mailbridge.config import ConfigError, load_config
+from mailbridge import __version__, imap
+from mailbridge.config import Config, ConfigError, load_config
+from mailbridge.imap import ImapError, RawMessage
 from mailbridge.log import setup_logging
+from mailbridge.telegram import TelegramClient, TelegramError
 
 logger = logging.getLogger("mailbridge")
 
 EXIT_OK = 0
+EXIT_FAILURE = 1
 EXIT_CONFIG_ERROR = 2
+
+DEFAULT_LIMIT = 10
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -23,6 +28,18 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--check",
         action="store_true",
         help="validate the configuration and exit without connecting to anything",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="fetch from the mailbox but send nothing to Telegram",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        metavar="N",
+        help=f"forward at most N messages in this pass (default: {DEFAULT_LIMIT})",
     )
     parser.add_argument("--version", action="version", version=f"mailbridge {__version__}")
     return parser.parse_args(argv)
@@ -51,5 +68,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info("configuration OK")
         return EXIT_OK
 
-    logger.info("nothing to run yet: the daemon loop arrives in Phase 1")
-    return EXIT_OK
+    return run_once(config, limit=args.limit, dry_run=args.dry_run)
+
+
+def run_once(config: Config, *, limit: int, dry_run: bool = False) -> int:
+    """Fetch the unseen messages once and forward them. No persistence yet."""
+    try:
+        with imap.connect(config) as client:
+            messages = imap.fetch_unseen(client, config.mail_folder, limit)
+    except ImapError as error:
+        logger.error("mailbox unavailable: %s", error)
+        return EXIT_FAILURE
+
+    if not messages:
+        logger.info("nothing to forward")
+        return EXIT_OK
+
+    if dry_run:
+        logger.info("dry run: %d message(s) fetched, none sent", len(messages))
+        return EXIT_OK
+
+    failures = 0
+    with TelegramClient(config.telegram_bot_token, config.telegram_chat_id) as telegram:
+        for message in messages:
+            try:
+                sent_id = telegram.send_message(_preview(message))
+            except TelegramError as error:
+                failures += 1
+                logger.error("uid %d not delivered: %s", message.uid, error)
+            else:
+                logger.info("uid %d delivered as telegram message %d", message.uid, sent_id)
+
+    logger.info("forwarded %d of %d message(s)", len(messages) - failures, len(messages))
+    return EXIT_FAILURE if failures else EXIT_OK
+
+
+def _preview(message: RawMessage) -> str:
+    """Placeholder body. Real parsing and formatting arrive in Phase 2."""
+    return (
+        "📩 New email\n\n"
+        f"UID: {message.uid}\n"
+        f"Size: {message.size} bytes\n\n"
+        "Headers and body land in Phase 2."
+    )
