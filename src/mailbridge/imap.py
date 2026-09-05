@@ -76,14 +76,32 @@ def connect(config: Config) -> Iterator[MailboxClient]:
         _logout(client)
 
 
-def fetch_unseen(client: MailboxClient, folder: str, limit: int | None = None) -> list[RawMessage]:
+def open_folder(client: MailboxClient, folder: str) -> int:
+    """Select the folder read-only and return its UIDVALIDITY.
+
+    UIDs are only meaningful within one UIDVALIDITY: when the server changes it,
+    every UID in the folder is renumbered and prior state no longer applies.
+    """
     try:
-        client.select_folder(folder, readonly=True)
+        response = client.select_folder(folder, readonly=True)
+    except _SERVER_ERRORS as error:
+        raise ImapError(f"cannot open folder {folder}: {error}") from error
+
+    uidvalidity = response.get(b"UIDVALIDITY") if isinstance(response, Mapping) else None
+    if not isinstance(uidvalidity, int):
+        raise ImapError(f"folder {folder} reported no UIDVALIDITY")
+    logger.info("opened %s (uidvalidity %d)", folder, uidvalidity)
+    return uidvalidity
+
+
+def fetch_unseen(client: MailboxClient, limit: int | None = None) -> list[RawMessage]:
+    """Fetch the unseen messages of the folder already opened by open_folder."""
+    try:
         uids = sorted(client.search(["UNSEEN"]))
     except _SERVER_ERRORS as error:
-        raise ImapError(f"cannot read folder {folder}: {error}") from error
+        raise ImapError(f"cannot search for unseen messages: {error}") from error
 
-    logger.info("%d unseen message(s) in %s", len(uids), folder)
+    logger.info("%d unseen message(s)", len(uids))
     if limit is not None and len(uids) > limit:
         logger.warning("limiting this pass to the %d oldest of %d unseen", limit, len(uids))
         uids = uids[:limit]

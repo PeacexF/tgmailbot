@@ -47,6 +47,7 @@ class Email:
     date: datetime | None
     body: str
     attachments: tuple[Attachment, ...]
+    message_id: str = ""
 
 
 def parse(raw: bytes) -> Email:
@@ -61,6 +62,7 @@ def parse(raw: bytes) -> Email:
         date=_date(message),
         body=text or html_to_text(html),
         attachments=tuple(_attachments(message)),
+        message_id=_header(message, "Message-ID"),
     )
 
 

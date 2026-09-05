@@ -4,11 +4,12 @@ import argparse
 import logging
 from collections.abc import Sequence
 
-from mailbridge import __version__, imap
+from mailbridge import __version__, database, imap
 from mailbridge.config import Config, ConfigError, load_config
-from mailbridge.imap import ImapError, RawMessage
+from mailbridge.database import Database, DatabaseError, MessageKey, Status
+from mailbridge.imap import ImapError
 from mailbridge.log import setup_logging
-from mailbridge.parser import parse
+from mailbridge.parser import Email, parse
 from mailbridge.telegram import TelegramClient, TelegramError, format_email
 
 logger = logging.getLogger("mailbridge")
@@ -73,10 +74,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def run_once(config: Config, *, limit: int, dry_run: bool = False) -> int:
-    """Fetch the unseen messages once and forward them. No persistence yet."""
+    """Fetch the unseen messages once and forward whatever has not been delivered yet."""
+    try:
+        with database.connect(config.database_path) as db:
+            return _pass(config, db, limit=limit, dry_run=dry_run)
+    except DatabaseError as error:
+        logger.error("state unavailable: %s", error)
+        return EXIT_FAILURE
+
+
+def _pass(config: Config, db: Database, *, limit: int, dry_run: bool) -> int:
+    interrupted = db.interrupted()
+    if interrupted:
+        logger.warning(
+            "%d message(s) were interrupted mid-delivery and will be retried", len(interrupted)
+        )
+
     try:
         with imap.connect(config) as client:
-            messages = imap.fetch_unseen(client, config.mail_folder, limit)
+            uidvalidity = imap.open_folder(client, config.mail_folder)
+            messages = imap.fetch_unseen(client, limit)
     except ImapError as error:
         logger.error("mailbox unavailable: %s", error)
         return EXIT_FAILURE
@@ -89,32 +106,51 @@ def run_once(config: Config, *, limit: int, dry_run: bool = False) -> int:
         logger.info("dry run: %d message(s) fetched, none sent", len(messages))
         return EXIT_OK
 
+    pending: list[tuple[MessageKey, Email]] = []
+    skipped = 0
+    for message in messages:
+        key = MessageKey(config.mail_username, uidvalidity, message.uid)
+        email = parse(message.raw)
+        logger.info(
+            "uid %d parsed: %d body characters, %d attachment(s)",
+            message.uid,
+            len(email.body),
+            len(email.attachments),
+        )
+
+        if db.record(key, email.message_id) is Status.SENT:
+            logger.info("uid %d already delivered, skipping", message.uid)
+            skipped += 1
+            continue
+
+        # The same message can reappear under a new UID after a UIDVALIDITY reset.
+        if db.delivered_message_id(key.mailbox, email.message_id):
+            logger.info("uid %d matches an already delivered Message-ID, skipping", message.uid)
+            db.mark_sent(key)
+            skipped += 1
+            continue
+
+        pending.append((key, email))
+
+    if not pending:
+        logger.info("nothing new to forward (%d already delivered)", skipped)
+        return EXIT_OK
+
     failures = 0
     with TelegramClient(config.telegram_bot_token, config.telegram_chat_id) as telegram:
-        for message in messages:
+        for key, email in pending:
+            # Claimed and committed before the send, so a crash mid-delivery leaves a
+            # record to retry: at-least-once, per PLAN.
+            db.claim(key)
             try:
-                sent_ids = telegram.send_text(_render(message))
+                sent_ids = telegram.send_text(format_email(email))
             except TelegramError as error:
                 failures += 1
-                logger.error("uid %d not delivered: %s", message.uid, error)
+                db.mark_failed(key, str(error))
+                logger.error("uid %d not delivered: %s", key.uid, error)
             else:
-                logger.info(
-                    "uid %d delivered as %d telegram message(s): %s",
-                    message.uid,
-                    len(sent_ids),
-                    ", ".join(str(i) for i in sent_ids),
-                )
+                db.mark_sent(key, sent_ids[0] if sent_ids else None)
+                logger.info("uid %d delivered as %d telegram message(s)", key.uid, len(sent_ids))
 
-    logger.info("forwarded %d of %d message(s)", len(messages) - failures, len(messages))
+    logger.info("forwarded %d, skipped %d, failed %d", len(pending) - failures, skipped, failures)
     return EXIT_FAILURE if failures else EXIT_OK
-
-
-def _render(message: RawMessage) -> str:
-    email = parse(message.raw)
-    logger.info(
-        "uid %d parsed: %d body characters, %d attachment(s)",
-        message.uid,
-        len(email.body),
-        len(email.attachments),
-    )
-    return format_email(email)

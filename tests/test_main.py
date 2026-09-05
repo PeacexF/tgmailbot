@@ -8,6 +8,7 @@ from typing import Any, ClassVar
 import pytest
 
 from mailbridge.config import Config, load_config
+from mailbridge.database import MessageKey, Status, connect
 from mailbridge.imap import ImapError, MailboxClient
 from mailbridge.main import EXIT_CONFIG_ERROR, EXIT_FAILURE, EXIT_OK, main, run_once
 from mailbridge.telegram import TelegramError
@@ -16,12 +17,21 @@ from .test_config import VALID_ENV
 from .test_imap import FakeClient
 
 
-def eml(subject: str = "Invoice 4821", body: str = "Here is the invoice.") -> bytes:
+def eml(
+    subject: str = "Invoice 4821",
+    body: str = "Here is the invoice.",
+    message_id: str | None = None,
+) -> bytes:
+    """A minimal but realistic message. Pass message_id="" to omit the header."""
+    if message_id is None:
+        message_id = f"<{subject.replace(' ', '-')}@example.com>"
+    header = f"Message-ID: {message_id}\r\n" if message_id else ""
     return (
         "From: John Doe <john@example.com>\r\n"
         "To: user@mail.ru\r\n"
         f"Subject: {subject}\r\n"
         "Date: Fri, 5 Sep 2026 12:41:00 +0300\r\n"
+        f"{header}"
         "\r\n"
         f"{body}\r\n"
     ).encode()
@@ -36,8 +46,8 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> pytest.Monk
 
 
 @pytest.fixture
-def config() -> Config:
-    return load_config(VALID_ENV)
+def config(tmp_path: Path) -> Config:
+    return load_config(VALID_ENV | {"DATABASE_PATH": str(tmp_path / "state.db")})
 
 
 class FakeTelegram:
@@ -247,3 +257,137 @@ class TestRunOnce:
         run_once(config, limit=10)
 
         assert telegram.instances[0].closed
+
+
+class TestDeduplication:
+    def test_a_second_pass_sends_nothing_new(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        mailbox(FakeClient([1, 2], bodies={1: eml("first"), 2: eml("second")}))
+
+        assert run_once(config, limit=10) == EXIT_OK
+        assert run_once(config, limit=10) == EXIT_OK
+
+        assert len(telegram.instances[0].sent) == 2
+        assert len(telegram.instances) == 1
+
+    def test_only_the_new_message_is_sent_on_a_later_pass(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        mailbox(FakeClient([1], bodies={1: eml("first")}))
+        run_once(config, limit=10)
+
+        mailbox(FakeClient([1, 2], bodies={1: eml("first"), 2: eml("second")}))
+        run_once(config, limit=10)
+
+        assert len(telegram.instances[1].sent) == 1
+        assert "second" in telegram.instances[1].sent[0]
+
+    def test_delivery_state_is_persisted(self, config: Config, mailbox: Any, telegram: Any) -> None:
+        mailbox(FakeClient([7], bodies={7: eml()}))
+
+        run_once(config, limit=10)
+
+        with connect(config.database_path) as db:
+            record = db.get(MessageKey(config.mail_username, 42, 7))
+            assert record is not None
+            assert record.status is Status.SENT
+            assert record.telegram_message_id == 1001
+
+    def test_a_uidvalidity_reset_does_not_resend(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        message = eml("renumbered")
+        mailbox(FakeClient([5], bodies={5: message}, uidvalidity=42))
+        run_once(config, limit=10)
+
+        # The server renumbered the folder: same message, new UIDVALIDITY and UID.
+        mailbox(FakeClient([1], bodies={1: message}, uidvalidity=77))
+        run_once(config, limit=10)
+
+        # Nothing to send, so the second pass never opens a Telegram client at all.
+        assert len(telegram.instances) == 1
+        assert len(telegram.instances[0].sent) == 1
+
+    def test_a_reset_resends_a_message_that_carries_no_message_id(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        # Without a Message-ID there is nothing left to recognise the message by,
+        # so a renumbered folder produces a duplicate rather than a loss.
+        message = eml("anonymous", message_id="")
+        mailbox(FakeClient([5], bodies={5: message}, uidvalidity=42))
+        run_once(config, limit=10)
+
+        mailbox(FakeClient([1], bodies={1: message}, uidvalidity=77))
+        run_once(config, limit=10)
+
+        assert len(telegram.instances[1].sent) == 1
+
+    def test_a_failed_message_is_retried_on_the_next_pass(
+        self, config: Config, mailbox: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        FakeTelegram.instances = []
+        monkeypatch.setattr(
+            "mailbridge.main.TelegramClient",
+            lambda *args, **kwargs: FakeTelegram(fail_on={"flaky"}),
+        )
+        mailbox(FakeClient([1], bodies={1: eml("flaky")}))
+        assert run_once(config, limit=10) == EXIT_FAILURE
+
+        monkeypatch.setattr("mailbridge.main.TelegramClient", FakeTelegram)
+        assert run_once(config, limit=10) == EXIT_OK
+        assert len(FakeTelegram.instances[1].sent) == 1
+
+    def test_a_dry_run_records_no_state(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        mailbox(FakeClient([1], bodies={1: eml()}))
+
+        run_once(config, limit=10, dry_run=True)
+
+        with connect(config.database_path) as db:
+            assert db.status_of(MessageKey(config.mail_username, 42, 1)) is None
+
+
+class TestCrashRecovery:
+    def test_a_crash_mid_delivery_resends_rather_than_loses(
+        self, config: Config, mailbox: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class CrashError(Exception):
+            pass
+
+        class Crashing(FakeTelegram):
+            def send_text(self, text: str) -> list[int]:
+                raise CrashError("process died mid-send")
+
+        FakeTelegram.instances = []
+        monkeypatch.setattr("mailbridge.main.TelegramClient", Crashing)
+        mailbox(FakeClient([1], bodies={1: eml()}))
+
+        with pytest.raises(CrashError):
+            run_once(config, limit=10)
+
+        key = MessageKey(config.mail_username, 42, 1)
+        with connect(config.database_path) as db:
+            assert db.interrupted() == [key]
+
+        monkeypatch.setattr("mailbridge.main.TelegramClient", FakeTelegram)
+        assert run_once(config, limit=10) == EXIT_OK
+
+        assert len(FakeTelegram.instances[-1].sent) == 1
+        with connect(config.database_path) as db:
+            record = db.get(key)
+            assert record is not None
+            assert record.status is Status.SENT
+            assert record.attempts == 2
+
+    def test_the_duplicate_is_bounded_to_one(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        mailbox(FakeClient([1], bodies={1: eml()}))
+        run_once(config, limit=10)
+        run_once(config, limit=10)
+        run_once(config, limit=10)
+
+        total = sum(len(instance.sent) for instance in telegram.instances)
+        assert total == 1
