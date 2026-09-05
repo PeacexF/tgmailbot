@@ -1,35 +1,58 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import pytest
 
 from mailbridge.config import Secret
-from mailbridge.telegram import MAX_MESSAGE_LENGTH, TelegramClient, TelegramError
+from mailbridge.parser import Attachment, Email
+from mailbridge.telegram import (
+    MAX_MESSAGE_LENGTH,
+    TelegramClient,
+    TelegramError,
+    escape,
+    format_email,
+    format_size,
+    split_text,
+)
 
 TOKEN = "123456:AAHfakeTokenValue"
 CHAT_ID = "-1001234567890"
 
+Handler = Callable[[httpx.Request], httpx.Response]
 
-def make_client(
-    handler: object, *, token: str = TOKEN
-) -> tuple[TelegramClient, list[httpx.Request]]:
+SAMPLE = Email(
+    subject="Invoice #4821",
+    sender="John Doe <john@example.com>",
+    to=("user@mail.ru",),
+    cc=(),
+    date=datetime(2026, 9, 5, 12, 41, tzinfo=UTC),
+    body="Here is the invoice.",
+    attachments=(),
+)
+
+
+def make_client(handler: Handler) -> tuple[TelegramClient, list[httpx.Request]]:
     seen: list[httpx.Request] = []
 
     def record(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        assert callable(handler)
-        response: httpx.Response = handler(request)
-        return response
+        return handler(request)
 
-    client = TelegramClient(Secret(token), CHAT_ID, transport=httpx.MockTransport(record))
+    client = TelegramClient(Secret(TOKEN), CHAT_ID, transport=httpx.MockTransport(record))
     return client, seen
 
 
-def ok(result: dict[str, Any]) -> object:
-    return lambda request: httpx.Response(200, json={"ok": True, "result": result})
+def ok(result: dict[str, Any]) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "result": result})
+
+    return handler
 
 
 def body_of(request: httpx.Request) -> dict[str, Any]:
@@ -150,3 +173,159 @@ class TestTokenSafety:
             client.send_message("hello")
 
         assert TOKEN not in str(raised.value)
+
+
+class TestEscape:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("plain", "plain"),
+            ("a & b", "a &amp; b"),
+            ("<b>bold</b>", "&lt;b&gt;bold&lt;/b&gt;"),
+            ("a <script>x</script>", "a &lt;script&gt;x&lt;/script&gt;"),
+        ],
+    )
+    def test_escapes_the_three_html_characters(self, raw: str, expected: str) -> None:
+        assert escape(raw) == expected
+
+    def test_ampersand_is_escaped_before_the_angle_brackets(self) -> None:
+        assert escape("&lt;") == "&amp;lt;"
+
+
+class TestFormatEmail:
+    def test_renders_the_header_block(self) -> None:
+        rendered = format_email(SAMPLE)
+
+        assert "<b>From:</b> John Doe &lt;john@example.com&gt;" in rendered
+        assert "<b>To:</b> user@mail.ru" in rendered
+        assert "<b>Subject:</b> Invoice #4821" in rendered
+        assert "<b>Date:</b> 2026-09-05 12:41" in rendered
+
+    def test_includes_the_body(self) -> None:
+        assert "Here is the invoice." in format_email(SAMPLE)
+
+    def test_omits_cc_when_absent(self) -> None:
+        assert "<b>Cc:</b>" not in format_email(SAMPLE)
+
+    def test_includes_cc_when_present(self) -> None:
+        rendered = format_email(replace(SAMPLE, cc=("Boss <boss@example.com>",)))
+
+        assert "<b>Cc:</b> Boss &lt;boss@example.com&gt;" in rendered
+
+    def test_omits_the_date_line_when_there_is_no_date(self) -> None:
+        assert "<b>Date:</b>" not in format_email(replace(SAMPLE, date=None))
+
+    def test_marks_an_empty_body(self) -> None:
+        assert "<i>(empty body)</i>" in format_email(replace(SAMPLE, body=""))
+
+    def test_falls_back_when_the_subject_is_missing(self) -> None:
+        assert "(no subject)" in format_email(replace(SAMPLE, subject=""))
+
+    def test_escapes_markup_in_the_subject(self) -> None:
+        rendered = format_email(replace(SAMPLE, subject="<b>not bold</b>"))
+
+        assert "&lt;b&gt;not bold&lt;/b&gt;" in rendered
+
+    def test_escapes_markup_in_the_body(self) -> None:
+        rendered = format_email(replace(SAMPLE, body="1 < 2 && 3 > 2"))
+
+        assert "1 &lt; 2 &amp;&amp; 3 &gt; 2" in rendered
+
+    def test_lists_attachments_with_their_size(self) -> None:
+        rendered = format_email(
+            replace(
+                SAMPLE,
+                attachments=(Attachment("invoice.pdf", "application/pdf", b"x" * 2048),),
+            )
+        )
+
+        assert "📎 invoice.pdf (2.0 KB)" in rendered
+
+    @pytest.mark.parametrize(
+        ("size", "expected"),
+        [
+            (0, "0 B"),
+            (512, "512 B"),
+            (1024, "1.0 KB"),
+            (1536, "1.5 KB"),
+            (5 * 1024 * 1024, "5.0 MB"),
+        ],
+    )
+    def test_formats_sizes(self, size: int, expected: str) -> None:
+        assert format_size(size) == expected
+
+
+class TestSplitText:
+    def test_a_short_message_is_one_chunk(self) -> None:
+        assert split_text("hello") == ["hello"]
+
+    def test_empty_text_produces_nothing(self) -> None:
+        assert split_text("") == []
+
+    def test_every_chunk_respects_the_limit(self) -> None:
+        text = "\n".join(f"line {i}" for i in range(500))
+
+        assert all(len(chunk) <= 100 for chunk in split_text(text, limit=100))
+
+    def test_splitting_loses_no_words(self) -> None:
+        text = "\n".join(f"line {i}" for i in range(500))
+
+        joined = " ".join(split_text(text, limit=100))
+        assert all(f"line {i}" in joined for i in range(500))
+
+    def test_prefers_line_boundaries(self) -> None:
+        text = "\n".join(["a" * 40] * 6)
+
+        assert all(
+            "\n" not in chunk or chunk.count("a" * 40) > 1 for chunk in split_text(text, 100)
+        )
+
+    def test_hard_splits_a_single_overlong_line(self) -> None:
+        chunks = split_text("x" * 250, limit=100)
+
+        assert len(chunks) == 3
+        assert "".join(chunks) == "x" * 250
+
+    def test_never_cuts_an_entity_in_half(self) -> None:
+        text = "x" * 97 + "&amp;" + "y" * 100
+
+        for chunk in split_text(text, limit=100):
+            assert "&" not in chunk or "&amp;" in chunk
+
+    def test_never_cuts_a_tag_in_half(self) -> None:
+        text = "x" * 97 + "<b>bold</b>" + "y" * 100
+
+        for chunk in split_text(text, limit=100):
+            assert chunk.count("<") == chunk.count(">")
+
+    def test_a_long_email_splits_into_several_messages(self) -> None:
+        long_body = "\n".join("word " * 20 for _ in range(200))
+        chunks = split_text(format_email(replace(SAMPLE, body=long_body)))
+
+        assert len(chunks) > 1
+        assert all(len(chunk) <= MAX_MESSAGE_LENGTH for chunk in chunks)
+
+
+class TestSendText:
+    def test_sends_one_message_for_short_text(self) -> None:
+        client, seen = make_client(ok({"message_id": 7}))
+
+        with client:
+            assert client.send_text("hello") == [7]
+        assert len(seen) == 1
+
+    def test_sends_one_message_per_chunk(self) -> None:
+        client, seen = make_client(ok({"message_id": 7}))
+
+        with client:
+            client.send_text("y" * (MAX_MESSAGE_LENGTH * 2 + 10))
+
+        assert len(seen) == 3
+
+    def test_uses_html_parse_mode(self) -> None:
+        client, seen = make_client(ok({"message_id": 7}))
+
+        with client:
+            client.send_text("hello")
+
+        assert body_of(seen[0])["parse_mode"] == "HTML"

@@ -1,0 +1,10 @@
+From: newsletter@example.com
+To: user@mail.ru
+Subject: Weekly digest
+Date: Tue, 2 Jun 2026 08:30:00 +0000
+Content-Type: text/html; charset="utf-8"
+
+<html><head><style>p { color: red; }</style><title>ignored</title></head>
+<body><p>First paragraph.</p><p>Second &amp; last.</p>
+<script>alert('no');</script>
+<div>Tail<br>line</div></body></html>

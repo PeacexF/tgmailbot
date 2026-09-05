@@ -27,18 +27,18 @@ class FakeClient:
         if self._fails_on == operation:
             raise OSError(f"{operation} exploded")
 
-    def select_folder(self, folder: str, readonly: bool = False) -> Any:
+    def select_folder(self, folder: Any, readonly: Any = False) -> Any:
         self._maybe_fail("select_folder")
-        self.selected = (folder, readonly)
+        self.selected = (str(folder), bool(readonly))
         return {b"EXISTS": len(self._uids)}
 
-    def search(self, criteria: Sequence[str]) -> Sequence[int]:
+    def search(self, criteria: Any = "ALL", charset: Any = None) -> Sequence[int]:
         self._maybe_fail("search")
         assert list(criteria) == ["UNSEEN"]
         return list(self._uids)
 
     def fetch(
-        self, messages: Sequence[int], data: Sequence[str]
+        self, messages: Any, data: Any, modifiers: Any = None
     ) -> Mapping[int, Mapping[bytes, Any]]:
         self._maybe_fail("fetch")
         assert list(data) == ["BODY.PEEK[]"]

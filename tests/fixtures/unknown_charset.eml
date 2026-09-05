@@ -1,0 +1,7 @@
+From: someone@example.com
+To: user@mail.ru
+Subject: Strange charset
+Date: Fri, 5 Jun 2026 11:00:00 +0000
+Content-Type: text/plain; charset="x-not-a-charset"
+
+Body in a charset nobody has heard of.

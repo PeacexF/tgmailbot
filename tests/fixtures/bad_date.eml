@@ -1,0 +1,7 @@
+From: someone@example.com
+To: user@mail.ru
+Subject: Broken date
+Date: not a real date at all
+Content-Type: text/plain; charset="utf-8"
+
+The Date header is nonsense.

@@ -15,6 +15,7 @@ mailbridge = "mailbridge.main:main"
 
 [dependency-groups]
 dev = [
+    "basedpyright>=1.23",
     "mypy>=1.14",
     "pytest>=8.3",
     "ruff>=0.9",
@@ -53,6 +54,10 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["ARG"]
+
+[tool.basedpyright]
+include = ["src", "tests"]
+typeCheckingMode = "standard"
 
 [tool.mypy]
 python_version = "3.14"

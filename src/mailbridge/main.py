@@ -8,7 +8,8 @@ from mailbridge import __version__, imap
 from mailbridge.config import Config, ConfigError, load_config
 from mailbridge.imap import ImapError, RawMessage
 from mailbridge.log import setup_logging
-from mailbridge.telegram import TelegramClient, TelegramError
+from mailbridge.parser import parse
+from mailbridge.telegram import TelegramClient, TelegramError, format_email
 
 logger = logging.getLogger("mailbridge")
 
@@ -92,22 +93,28 @@ def run_once(config: Config, *, limit: int, dry_run: bool = False) -> int:
     with TelegramClient(config.telegram_bot_token, config.telegram_chat_id) as telegram:
         for message in messages:
             try:
-                sent_id = telegram.send_message(_preview(message))
+                sent_ids = telegram.send_text(_render(message))
             except TelegramError as error:
                 failures += 1
                 logger.error("uid %d not delivered: %s", message.uid, error)
             else:
-                logger.info("uid %d delivered as telegram message %d", message.uid, sent_id)
+                logger.info(
+                    "uid %d delivered as %d telegram message(s): %s",
+                    message.uid,
+                    len(sent_ids),
+                    ", ".join(str(i) for i in sent_ids),
+                )
 
     logger.info("forwarded %d of %d message(s)", len(messages) - failures, len(messages))
     return EXIT_FAILURE if failures else EXIT_OK
 
 
-def _preview(message: RawMessage) -> str:
-    """Placeholder body. Real parsing and formatting arrive in Phase 2."""
-    return (
-        "📩 New email\n\n"
-        f"UID: {message.uid}\n"
-        f"Size: {message.size} bytes\n\n"
-        "Headers and body land in Phase 2."
+def _render(message: RawMessage) -> str:
+    email = parse(message.raw)
+    logger.info(
+        "uid %d parsed: %d body characters, %d attachment(s)",
+        message.uid,
+        len(email.body),
+        len(email.attachments),
     )
+    return format_email(email)

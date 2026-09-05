@@ -16,6 +16,17 @@ from .test_config import VALID_ENV
 from .test_imap import FakeClient
 
 
+def eml(subject: str = "Invoice 4821", body: str = "Here is the invoice.") -> bytes:
+    return (
+        "From: John Doe <john@example.com>\r\n"
+        "To: user@mail.ru\r\n"
+        f"Subject: {subject}\r\n"
+        "Date: Fri, 5 Sep 2026 12:41:00 +0300\r\n"
+        "\r\n"
+        f"{body}\r\n"
+    ).encode()
+
+
 @pytest.fixture
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     monkeypatch.chdir(tmp_path)
@@ -52,6 +63,9 @@ class FakeTelegram:
             raise TelegramError("rejected by the API")
         self.sent.append(text)
         return 1000 + len(self.sent)
+
+    def send_text(self, text: str) -> list[int]:
+        return [self.send_message(text)]
 
 
 @pytest.fixture
@@ -146,16 +160,25 @@ class TestRunOnce:
         assert run_once(config, limit=10) == EXIT_OK
         assert len(telegram.instances[0].sent) == 2
 
-    def test_the_body_carries_the_uid_and_size(
+    def test_the_body_carries_the_parsed_email(
         self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
     ) -> None:
-        mailbox(FakeClient([3], bodies={3: b"0123456789"}))
+        mailbox(FakeClient([3], bodies={3: eml()}))
 
         run_once(config, limit=10)
 
         body = telegram.instances[0].sent[0]
-        assert "UID: 3" in body
-        assert "10 bytes" in body
+        assert "Invoice 4821" in body
+        assert "john@example.com" in body
+        assert "Here is the invoice." in body
+
+    def test_an_unparsable_message_still_produces_a_message(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        mailbox(FakeClient([3], bodies={3: b"\x00\x01 not really an email"}))
+
+        assert run_once(config, limit=10) == EXIT_OK
+        assert len(telegram.instances[0].sent) == 1
 
     def test_an_empty_mailbox_sends_nothing(
         self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
@@ -196,9 +219,9 @@ class TestRunOnce:
         FakeTelegram.instances = []
         monkeypatch.setattr(
             "mailbridge.main.TelegramClient",
-            lambda *args, **kwargs: FakeTelegram(fail_on={"UID: 2"}),
+            lambda *args, **kwargs: FakeTelegram(fail_on={"second"}),
         )
-        mailbox(FakeClient([1, 2]))
+        mailbox(FakeClient([1, 2], bodies={1: eml("first"), 2: eml("second")}))
 
         assert run_once(config, limit=10) == EXIT_FAILURE
 
@@ -208,9 +231,9 @@ class TestRunOnce:
         FakeTelegram.instances = []
         monkeypatch.setattr(
             "mailbridge.main.TelegramClient",
-            lambda *args, **kwargs: FakeTelegram(fail_on={"UID: 1"}),
+            lambda *args, **kwargs: FakeTelegram(fail_on={"first"}),
         )
-        mailbox(FakeClient([1, 2, 3]))
+        mailbox(FakeClient([1, 2, 3], bodies={1: eml("first"), 2: eml("second"), 3: eml("third")}))
 
         run_once(config, limit=10)
 

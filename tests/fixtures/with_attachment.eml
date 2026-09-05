@@ -1,0 +1,26 @@
+From: Accounts <accounts@example.com>
+To: user@mail.ru
+Subject: Two documents
+Date: Sat, 6 Jun 2026 14:05:00 +0000
+Content-Type: multipart/mixed; boundary="MIXED"
+
+--MIXED
+Content-Type: text/plain; charset="utf-8"
+
+Please find both files attached.
+
+--MIXED
+Content-Type: application/pdf; name="invoice.pdf"
+Content-Disposition: attachment; filename="invoice.pdf"
+Content-Transfer-Encoding: base64
+
+SGVsbG8gd29ybGQh
+
+--MIXED
+Content-Type: application/octet-stream
+Content-Disposition: attachment; filename="../../etc/passwd"
+Content-Transfer-Encoding: base64
+
+cm9vdDp4OjA6MDo=
+
+--MIXED--

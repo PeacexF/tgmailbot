@@ -6,7 +6,7 @@ help:
 	@echo "lock          refresh uv.lock"
 	@echo "lint          ruff check + format check"
 	@echo "format        apply ruff formatting and fixes"
-	@echo "typecheck     mypy"
+	@echo "typecheck     mypy + basedpyright"
 	@echo "test          pytest"
 	@echo "check         lint + typecheck + test (what CI runs)"
 	@echo "run           run the daemon"
@@ -31,6 +31,7 @@ format:
 
 typecheck:
 	uv run mypy
+	uv run basedpyright
 
 test:
 	uv run pytest

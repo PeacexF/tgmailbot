@@ -1,0 +1,18 @@
+From: Sales <sales@example.com>
+To: user@mail.ru
+Cc: Boss <boss@example.com>, other@example.com
+Subject: Quarterly report
+Date: Mon, 1 Jun 2026 09:00:00 +0000
+Content-Type: multipart/alternative; boundary="BOUND1"
+
+--BOUND1
+Content-Type: text/plain; charset="utf-8"
+
+The plain text version.
+
+--BOUND1
+Content-Type: text/html; charset="utf-8"
+
+<html><body><p>The <b>HTML</b> version.</p></body></html>
+
+--BOUND1--

@@ -30,7 +30,9 @@ jobs:
         run: uv run ruff format --check .
 
       - name: Types
-        run: uv run mypy
+        run: |
+          uv run mypy
+          uv run basedpyright
 
       - name: Tests
         run: uv run pytest
