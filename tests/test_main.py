@@ -1,17 +1,32 @@
 from __future__ import annotations
 
 import base64
+import logging
+import os
+import signal
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NoReturn
 
 import pytest
 
 from mailbridge.config import Config, load_config
 from mailbridge.database import MessageKey, Status, connect
 from mailbridge.imap import ImapError, MailboxClient
-from mailbridge.main import EXIT_CONFIG_ERROR, EXIT_FAILURE, EXIT_OK, main, run_once
+from mailbridge.main import (
+    EXIT_CONFIG_ERROR,
+    EXIT_FAILURE,
+    EXIT_OK,
+    HEARTBEAT_INTERVAL,
+    RECONNECT_MAX_DELAY,
+    Shutdown,
+    _Heartbeat,
+    _reconnect_delay,
+    main,
+    run_forever,
+    run_once,
+)
 from mailbridge.telegram import TelegramError
 
 from .test_config import VALID_ENV
@@ -541,3 +556,223 @@ class TestAttachments:
 
         assert len(telegram.instances) == 1
         assert len(telegram.instances[0].uploaded) == 1
+
+
+class TestCatchUpAcrossRestarts:
+    def test_downtime_mail_is_forwarded_even_if_already_seen(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        mailbox(FakeClient([1], bodies={1: eml("before")}))
+        run_once(config, limit=10)
+
+        # While the daemon was down 2 and 3 arrived, and both were read in the webmail,
+        # so a \Seen-based search would miss them entirely.
+        client = FakeClient([1, 2, 3], bodies={1: eml("before"), 2: eml("during"), 3: eml("after")})
+        mailbox(client)
+        run_once(config, limit=10)
+
+        assert client.searched[-1] == ["UID", "2:*"]
+        assert len(telegram.instances[1].sent) == 2
+
+    def test_an_unresolved_message_is_refetched(
+        self, config: Config, mailbox: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        FakeTelegram.instances = []
+        monkeypatch.setattr(
+            "mailbridge.main.TelegramClient",
+            lambda *args, **kwargs: FakeTelegram(fail_on={"flaky"}),
+        )
+        mailbox(FakeClient([1, 2], bodies={1: eml("flaky"), 2: eml("fine")}))
+        run_once(config, limit=10)
+
+        # UID 1 failed, so the resume mark must stay below it rather than skipping ahead.
+        monkeypatch.setattr("mailbridge.main.TelegramClient", FakeTelegram)
+        client = FakeClient([1, 2], bodies={1: eml("flaky"), 2: eml("fine")})
+        mailbox(client)
+        run_once(config, limit=10)
+
+        assert client.searched[-1] == ["UID", "1:*"]
+        assert len(FakeTelegram.instances[1].sent) == 1
+
+    def test_a_burst_is_capped_per_pass(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        bodies = {uid: eml(f"message {uid}") for uid in range(1, 21)}
+        mailbox(FakeClient(list(bodies), bodies=bodies))
+
+        run_once(config, limit=5)
+
+        assert len(telegram.instances[0].sent) == 5
+
+
+class TestRunForever:
+    def test_it_stops_when_shutdown_is_requested(
+        self, config: Config, mailbox: Any, telegram: type[FakeTelegram]
+    ) -> None:
+        stop = Shutdown()
+        stop.request()
+        mailbox(FakeClient([1], bodies={1: eml()}))
+
+        assert run_forever(config, limit=10, shutdown=stop) == EXIT_OK
+        assert telegram.instances[0].sent == []
+
+    def test_it_delivers_then_stops_at_the_first_idle(
+        self,
+        config: Config,
+        mailbox: Any,
+        telegram: type[FakeTelegram],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        stop = Shutdown()
+
+        def idle(client: Any, **kwargs: Any) -> bool:
+            stop.request()
+            return False
+
+        monkeypatch.setattr("mailbridge.main.imap.idle", idle)
+        mailbox(FakeClient([1], bodies={1: eml()}))
+
+        assert run_forever(config, limit=10, shutdown=stop) == EXIT_OK
+        assert len(telegram.instances[0].sent) == 1
+
+    def test_a_dropped_connection_is_retried(
+        self, config: Config, telegram: type[FakeTelegram], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stop = Shutdown()
+        attempts: list[int] = []
+
+        @contextmanager
+        def flaky_connect(_: Config) -> Iterator[MailboxClient]:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise ImapError("connection reset by peer")
+            yield FakeClient([1], bodies={1: eml()})
+
+        def idle(client: Any, **kwargs: Any) -> bool:
+            stop.request()
+            return False
+
+        monkeypatch.setattr("mailbridge.main.imap.connect", flaky_connect)
+        monkeypatch.setattr("mailbridge.main.imap.idle", idle)
+        monkeypatch.setattr("mailbridge.main._reconnect_delay", lambda attempt: 0.0)
+
+        assert run_forever(config, limit=10, shutdown=stop) == EXIT_OK
+        assert len(attempts) == 2
+        assert len(telegram.instances[0].sent) == 1
+
+    def test_a_drop_during_shutdown_does_not_reconnect(
+        self, config: Config, telegram: type[FakeTelegram], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stop = Shutdown()
+        attempts: list[int] = []
+
+        def dropping(_: Config) -> NoReturn:
+            # connect() itself fails, before the with-block ever binds a client.
+            attempts.append(1)
+            stop.request()
+            raise ImapError("connection reset by peer")
+
+        monkeypatch.setattr("mailbridge.main.imap.connect", dropping)
+
+        assert run_forever(config, limit=10, shutdown=stop) == EXIT_OK
+        assert len(attempts) == 1
+
+    def test_a_uidvalidity_change_mid_run_is_handled(
+        self, config: Config, telegram: type[FakeTelegram], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stop = Shutdown()
+        clients = [
+            FakeClient([1], bodies={1: eml("first")}, uidvalidity=42),
+            FakeClient([1], bodies={1: eml("second")}, uidvalidity=99),
+        ]
+        opened: list[int] = []
+
+        @contextmanager
+        def connect_next(_: Config) -> Iterator[MailboxClient]:
+            opened.append(1)
+            yield clients[len(opened) - 1]
+
+        def idle(client: Any, **kwargs: Any) -> bool:
+            if len(opened) == 1:
+                # The server renumbered the folder and dropped us.
+                raise ImapError("connection reset by peer")
+            stop.request()
+            return False
+
+        monkeypatch.setattr("mailbridge.main.imap.connect", connect_next)
+        monkeypatch.setattr("mailbridge.main.imap.idle", idle)
+        monkeypatch.setattr("mailbridge.main._reconnect_delay", lambda attempt: 0.0)
+
+        assert run_forever(config, limit=10, shutdown=stop) == EXIT_OK
+
+        # Both are delivered: the new UIDVALIDITY is a fresh keyspace, so UID 1
+        # under 99 is not the UID 1 already recorded under 42.
+        assert len(telegram.instances[0].sent) == 2
+        with connect(config.database_path) as db:
+            assert db.status_of(MessageKey(config.mail_username, 42, 1)) is Status.SENT
+            assert db.status_of(MessageKey(config.mail_username, 99, 1)) is Status.SENT
+
+
+class TestShutdown:
+    def test_it_starts_unset(self) -> None:
+        assert Shutdown().requested() is False
+
+    def test_request_sets_it(self) -> None:
+        stop = Shutdown()
+        stop.request()
+
+        assert stop.requested() is True
+
+    def test_wait_returns_immediately_once_requested(self) -> None:
+        stop = Shutdown()
+        stop.request()
+
+        assert stop.wait(30.0) is True
+
+    def test_a_signal_sets_it(self) -> None:
+        stop = Shutdown()
+        stop.install()
+
+        os.kill(os.getpid(), signal.SIGINT)
+
+        assert stop.requested() is True
+
+
+class TestReconnectDelay:
+    def test_it_grows_with_each_attempt(self) -> None:
+        assert _reconnect_delay(1) < _reconnect_delay(5)
+
+    def test_it_is_capped(self) -> None:
+        assert _reconnect_delay(50) <= RECONNECT_MAX_DELAY * 1.25
+
+    def test_it_is_never_zero(self) -> None:
+        assert _reconnect_delay(1) > 0
+
+
+class TestHeartbeat:
+    def test_it_stays_quiet_before_the_interval(self, caplog: pytest.LogCaptureFixture) -> None:
+        clock = iter([0.0, 10.0])
+        heartbeat = _Heartbeat(monotonic=lambda: next(clock))
+
+        with caplog.at_level(logging.INFO, logger="mailbridge"):
+            heartbeat.maybe_log()
+
+        assert "alive" not in caplog.text
+
+    def test_it_logs_once_the_interval_has_passed(self, caplog: pytest.LogCaptureFixture) -> None:
+        clock = iter([0.0, HEARTBEAT_INTERVAL + 1])
+        heartbeat = _Heartbeat(monotonic=lambda: next(clock))
+        heartbeat.record(3, 1)
+
+        with caplog.at_level(logging.INFO, logger="mailbridge"):
+            heartbeat.maybe_log()
+
+        assert "alive: 2 delivered, 1 failed" in caplog.text
+
+    def test_it_accumulates_across_passes(self) -> None:
+        heartbeat = _Heartbeat(monotonic=lambda: 0.0)
+
+        heartbeat.record(2, 0)
+        heartbeat.record(3, 2)
+
+        assert (heartbeat.delivered, heartbeat.failed) == (3, 2)

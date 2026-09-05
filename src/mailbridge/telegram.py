@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import random
+import time
+from collections.abc import Callable
 from types import TracebackType
 from typing import Any, Final, Self
 
@@ -24,9 +27,43 @@ PARSE_MODE: Final = "HTML"
 MAX_UPLOAD_BYTES: Final = 50 * 1024 * 1024
 CAPTION_LIMIT: Final = 1024
 
+TOO_MANY_REQUESTS: Final = 429
+SERVER_ERROR: Final = 500
+
+MAX_ATTEMPTS: Final = 5
+RETRY_BASE_DELAY: Final = 1.0
+RETRY_MAX_DELAY: Final = 60.0
+
+# Telegram allows roughly 20 messages a minute to one group.
+MIN_SEND_INTERVAL: Final = 3.0
+
 
 class TelegramError(Exception):
-    pass
+    """A request that will not succeed by being repeated."""
+
+
+class RateLimiter:
+    """Spaces outgoing requests so a burst of mail cannot trip Telegram's limits."""
+
+    def __init__(
+        self,
+        min_interval: float,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._min_interval = min_interval
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._next_allowed = 0.0
+
+    def wait(self) -> None:
+        now = self._monotonic()
+        delay = self._next_allowed - now
+        if delay > 0:
+            self._sleep(delay)
+            now = self._monotonic()
+        self._next_allowed = now + self._min_interval
 
 
 class TelegramClient:
@@ -38,9 +75,16 @@ class TelegramClient:
         base_url: str = API_BASE,
         timeout: float = DEFAULT_TIMEOUT,
         transport: httpx.BaseTransport | None = None,
+        max_attempts: int = MAX_ATTEMPTS,
+        min_interval: float = MIN_SEND_INTERVAL,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._chat_id = chat_id
         self._token = token.reveal()
+        self._max_attempts = max(1, max_attempts)
+        self._sleep = sleep
+        self._limiter = RateLimiter(min_interval, monotonic=monotonic, sleep=sleep)
         self._http = httpx.Client(
             base_url=f"{base_url}/bot{self._token}",
             timeout=timeout,
@@ -118,21 +162,51 @@ class TelegramClient:
         return self._request(method, json=payload)
 
     def _request(self, method: str, **kwargs: Any) -> dict[str, Any]:
-        try:
-            response = self._http.post(f"/{method}", **kwargs)
-        except httpx.HTTPError as error:
-            raise TelegramError(f"{method} request failed: {self._scrub(str(error))}") from error
-        return self._unwrap(method, response)
+        """Post with retries: 429 honours retry_after, 5xx backs off, 4xx is final."""
+        failure = f"{method} failed"
+        for attempt in range(1, self._max_attempts + 1):
+            self._limiter.wait()
+            try:
+                response = self._http.post(f"/{method}", **kwargs)
+            except httpx.HTTPError as error:
+                failure = f"{method} request failed: {self._scrub(str(error))}"
+                if not self._pause(attempt, self._backoff(attempt), failure):
+                    break
+                continue
 
-    def _unwrap(self, method: str, response: httpx.Response) -> dict[str, Any]:
-        body: Any = None
-        try:
-            body = response.json()
-        except ValueError:
-            body = None
-        if not isinstance(body, dict):
-            body = {}
+            body = _body_of(response)
+            if response.status_code == TOO_MANY_REQUESTS:
+                delay = _retry_after(body) or self._backoff(attempt)
+                failure = f"{method} was rate limited"
+                if not self._pause(attempt, delay, failure):
+                    break
+                continue
 
+            if response.status_code >= SERVER_ERROR:
+                failure = f"{method} failed with HTTP {response.status_code}"
+                if not self._pause(attempt, self._backoff(attempt), failure):
+                    break
+                continue
+
+            return self._unwrap(method, response, body)
+
+        raise TelegramError(f"{failure} after {self._max_attempts} attempt(s)")
+
+    def _pause(self, attempt: int, delay: float, reason: str) -> bool:
+        """Sleep before the next attempt. False means the attempts are exhausted."""
+        if attempt >= self._max_attempts:
+            return False
+        logger.warning("%s; retrying in %.1fs (attempt %d)", reason, delay, attempt + 1)
+        self._sleep(delay)
+        return True
+
+    def _backoff(self, attempt: int) -> float:
+        delay: float = min(RETRY_BASE_DELAY * 2.0 ** (attempt - 1), RETRY_MAX_DELAY)
+        return delay + random.uniform(0.0, delay * 0.25)
+
+    def _unwrap(
+        self, method: str, response: httpx.Response, body: dict[str, Any]
+    ) -> dict[str, Any]:
         if response.status_code != httpx.codes.OK or body.get("ok") is not True:
             detail = body.get("description") or response.text[:200] or "no response body"
             raise TelegramError(
@@ -147,6 +221,22 @@ class TelegramClient:
     def _scrub(self, text: str) -> str:
         """The bot token sits in the request URL, which surfaces in some httpx errors."""
         return text.replace(self._token, "***")
+
+
+def _body_of(response: httpx.Response) -> dict[str, Any]:
+    try:
+        body: Any = response.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _retry_after(body: dict[str, Any]) -> float:
+    parameters = body.get("parameters")
+    if not isinstance(parameters, dict):
+        return 0.0
+    retry_after = parameters.get("retry_after")
+    return float(retry_after) if isinstance(retry_after, int | float) else 0.0
 
 
 def escape(text: str) -> str:

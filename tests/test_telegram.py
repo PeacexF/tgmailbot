@@ -15,6 +15,8 @@ from mailbridge.telegram import (
     CAPTION_LIMIT,
     MAX_MESSAGE_LENGTH,
     MAX_UPLOAD_BYTES,
+    MIN_SEND_INTERVAL,
+    RateLimiter,
     TelegramClient,
     TelegramError,
     escape,
@@ -39,14 +41,33 @@ SAMPLE = Email(
 )
 
 
-def make_client(handler: Handler) -> tuple[TelegramClient, list[httpx.Request]]:
+def make_client(
+    handler: Handler,
+    *,
+    max_attempts: int = 1,
+    slept: list[float] | None = None,
+    min_interval: float = MIN_SEND_INTERVAL,
+) -> tuple[TelegramClient, list[httpx.Request]]:
+    """A client whose clock is fake, so retries and rate limiting cost no real time."""
     seen: list[httpx.Request] = []
 
     def record(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         return handler(request)
 
-    client = TelegramClient(Secret(TOKEN), CHAT_ID, transport=httpx.MockTransport(record))
+    def sleep(seconds: float) -> None:
+        if slept is not None:
+            slept.append(seconds)
+
+    client = TelegramClient(
+        Secret(TOKEN),
+        CHAT_ID,
+        transport=httpx.MockTransport(record),
+        max_attempts=max_attempts,
+        min_interval=min_interval,
+        sleep=sleep,
+        monotonic=lambda: 0.0,
+    )
     return client, seen
 
 
@@ -442,3 +463,183 @@ class TestOversizedAttachmentNote:
         )
 
         assert "too large" not in rendered
+
+
+def rate_limited(retry_after: float | None, then: Handler) -> Handler:
+    """429 on the first call, then defer to the given handler."""
+    calls = {"n": 0}
+    parameters = {"retry_after": retry_after} if retry_after is not None else {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(
+                429,
+                json={
+                    "ok": False,
+                    "description": "Too Many Requests",
+                    **{"parameters": parameters},
+                },
+            )
+        return then(request)
+
+    return handler
+
+
+class TestRetryPolicy:
+    def test_a_429_is_retried(self) -> None:
+        client, seen = make_client(rate_limited(7, ok({"message_id": 3})), max_attempts=3)
+
+        with client:
+            assert client.send_message("hello") == 3
+        assert len(seen) == 2
+
+    def test_the_retry_after_delay_is_honoured(self) -> None:
+        slept: list[float] = []
+        client, _ = make_client(rate_limited(7, ok({"message_id": 3})), max_attempts=3, slept=slept)
+
+        with client:
+            client.send_message("hello")
+
+        assert 7 in slept
+
+    def test_a_429_without_retry_after_falls_back_to_backoff(self) -> None:
+        slept: list[float] = []
+        client, _ = make_client(
+            rate_limited(None, ok({"message_id": 3})), max_attempts=3, slept=slept, min_interval=0.0
+        )
+
+        with client:
+            client.send_message("hello")
+
+        assert any(delay > 0 for delay in slept)
+
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    def test_server_errors_are_retried(self, status: int) -> None:
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(status, text="upstream problem")
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 9}})
+
+        client, seen = make_client(handler, max_attempts=3)
+
+        with client:
+            assert client.send_message("hello") == 9
+        assert len(seen) == 2
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404])
+    def test_client_errors_are_not_retried(self, status: int) -> None:
+        client, seen = make_client(
+            lambda request: httpx.Response(status, json={"ok": False, "description": "no"}),
+            max_attempts=5,
+        )
+
+        with client, pytest.raises(TelegramError):
+            client.send_message("hello")
+
+        assert len(seen) == 1
+
+    def test_a_transport_failure_is_retried(self) -> None:
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectError("connection refused", request=request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 4}})
+
+        client, seen = make_client(handler, max_attempts=3)
+
+        with client:
+            assert client.send_message("hello") == 4
+        assert len(seen) == 2
+
+    def test_a_persistent_failure_gives_up_after_max_attempts(self) -> None:
+        client, seen = make_client(
+            lambda request: httpx.Response(503, text="still down"), max_attempts=4
+        )
+
+        with client, pytest.raises(TelegramError, match="4 attempt"):
+            client.send_message("hello")
+
+        assert len(seen) == 4
+
+    def test_backoff_grows_between_attempts(self) -> None:
+        slept: list[float] = []
+        client, _ = make_client(
+            lambda request: httpx.Response(503, text="down"),
+            max_attempts=4,
+            slept=slept,
+            min_interval=0.0,
+        )
+
+        with client, pytest.raises(TelegramError):
+            client.send_message("hello")
+
+        assert len(slept) == 3
+        assert slept[0] < slept[-1]
+
+    def test_a_429_storm_eventually_succeeds(self) -> None:
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] < 4:
+                return httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 1}})
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 12}})
+
+        client, seen = make_client(handler, max_attempts=5)
+
+        with client:
+            assert client.send_message("hello") == 12
+        assert len(seen) == 4
+
+    def test_an_upload_is_retried_too(self) -> None:
+        client, seen = make_client(rate_limited(1, ok({"message_id": 5})), max_attempts=3)
+
+        with client:
+            assert client.send_document("a.pdf", b"data", "application/pdf") == 5
+        assert len(seen) == 2
+
+
+class TestRateLimiter:
+    def test_the_first_call_does_not_wait(self) -> None:
+        slept: list[float] = []
+        limiter = RateLimiter(3.0, monotonic=lambda: 100.0, sleep=slept.append)
+
+        limiter.wait()
+
+        assert slept == []
+
+    def test_a_following_call_waits_the_interval(self) -> None:
+        slept: list[float] = []
+        limiter = RateLimiter(3.0, monotonic=lambda: 100.0, sleep=slept.append)
+
+        limiter.wait()
+        limiter.wait()
+
+        assert slept == [3.0]
+
+    def test_no_wait_once_enough_time_has_passed(self) -> None:
+        slept: list[float] = []
+        clock = iter([100.0, 200.0])
+        limiter = RateLimiter(3.0, monotonic=lambda: next(clock), sleep=slept.append)
+
+        limiter.wait()
+        limiter.wait()
+
+        assert slept == []
+
+    def test_sends_are_spaced(self) -> None:
+        slept: list[float] = []
+        client, _ = make_client(ok({"message_id": 1}), slept=slept)
+
+        with client:
+            client.send_message("one")
+            client.send_message("two")
+            client.send_message("three")
+
+        assert slept == [MIN_SEND_INTERVAL, MIN_SEND_INTERVAL]

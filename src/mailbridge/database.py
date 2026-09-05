@@ -157,6 +157,25 @@ class Database:
         ).fetchone()
         return row is not None
 
+    def resume_uid(self, mailbox: str, uidvalidity: int) -> int | None:
+        """Highest UID that can be skipped: everything at or below it is delivered.
+
+        Anything still pending, sending or failed pulls the mark back below itself, so
+        an unresolved message is fetched again rather than stranded under the mark.
+        """
+        unresolved = self._db.execute(
+            "SELECT MIN(uid) FROM messages WHERE mailbox = ? AND uidvalidity = ? AND status != ?",
+            (mailbox, uidvalidity, Status.SENT),
+        ).fetchone()[0]
+        if unresolved is not None:
+            return int(unresolved) - 1
+
+        highest = self._db.execute(
+            "SELECT MAX(uid) FROM messages WHERE mailbox = ? AND uidvalidity = ?",
+            (mailbox, uidvalidity),
+        ).fetchone()[0]
+        return int(highest) if highest is not None else None
+
     def interrupted(self) -> list[MessageKey]:
         """Messages left mid-flight by a crash: claimed, never resolved."""
         rows = self._db.execute(
