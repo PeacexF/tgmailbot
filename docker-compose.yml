@@ -6,7 +6,6 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      # Overrides the .env value: in the container the state is always on the volume.
       DATABASE_PATH: /data/mailbridge.db
     volumes:
       - ./data:/data
