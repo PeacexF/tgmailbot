@@ -1,0 +1,82 @@
+# Example systemd unit. Copy to /etc/systemd/system/mailbridge.service and
+# adjust the paths, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mailbridge
+#
+# Assumes a dedicated service account and layout:
+#   sudo useradd --system --home /opt/mailbridge --shell /usr/sbin/nologin mailbridge
+#   sudo install -d -o mailbridge -g mailbridge -m 0750 /opt/mailbridge /var/lib/mailbridge
+#   sudo install -o mailbridge -g mailbridge -m 0600 .env /etc/mailbridge.env
+# See docs/deployment.md for the full walkthrough.
+
+[Unit]
+Description=Mail.ru to Telegram bridge
+Documentation=https://github.com/PeacexF/tgmailbot
+# Both endpoints are remote, so there is nothing to do before the network is up.
+After=network-online.target
+Wants=network-online.target
+# Never give up: a multi-day outage must not leave the bridge stopped.
+# systemd only reads the start-rate limit from [Unit]; in [Service] it is ignored.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=mailbridge
+Group=mailbridge
+
+# Must be 0600 and owned by the service account: it holds the mailbox
+# application password and the bot token.
+EnvironmentFile=/etc/mailbridge.env
+Environment=DATABASE_PATH=/var/lib/mailbridge/mailbridge.db
+
+# WorkingDirectory is deliberately not the state directory: the bridge
+# auto-loads .env from the working directory, and EnvironmentFile is the
+# single source of credentials here.
+WorkingDirectory=/opt/mailbridge
+ExecStart=/opt/mailbridge/.venv/bin/mailbridge
+
+# The daemon finishes the in-flight message on SIGTERM, so let it land.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+Restart=always
+RestartSec=10s
+
+# Journal only. The bridge already keeps bodies and credentials out of its logs.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mailbridge
+
+# --- Hardening. The bridge needs outbound TCP, one state directory, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+# IMAPS and HTTPS over IPv4/IPv6; no unix sockets, no raw packets.
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# The one writable path: SQLite plus its -wal and -shm sidecars.
+ReadWritePaths=/var/lib/mailbridge
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

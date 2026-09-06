@@ -42,8 +42,8 @@ class DatabaseError(Exception):
 class Status(StrEnum):
     PENDING = "pending"
     SENDING = "sending"
-    SENT = "sent"
-    FAILED = "failed"
+    SENT    = "sent"
+    FAILED  = "failed"
 
 
 @dataclass(frozen=True, slots=True)

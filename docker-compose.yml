@@ -1,0 +1,33 @@
+services:
+  mailbridge:
+    build: .
+    image: mailbridge:latest
+    container_name: mailbridge
+    restart: unless-stopped
+
+    # Credentials stay in .env on the host (chmod 600) and are never baked
+    # into the image. See docs/deployment.md.
+    env_file: .env
+    environment:
+      # Overrides whatever DATABASE_PATH the .env carries: inside the
+      # container the state always lives on the mounted volume.
+      DATABASE_PATH: /data/mailbridge.db
+
+    # The SQLite file and its WAL survive container recreation here.
+    volumes:
+      - ./data:/data
+
+    # Outbound IMAP and HTTPS only; the bridge exposes no ports of its own.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

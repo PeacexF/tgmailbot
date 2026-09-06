@@ -1,0 +1,18 @@
+# Keep the build context to what the image actually needs. Everything is
+# excluded first so a new file cannot silently reach a layer.
+*
+
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+
+# Belt and braces: never let credentials or local state into an image layer,
+# even if the allowlist above widens later.
+**/.env
+**/.env.*
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/__pycache__/
+**/*.pyc
