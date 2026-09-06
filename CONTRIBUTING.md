@@ -6,7 +6,7 @@ This is primarily a **portfolio project**, built to demonstrate practical backen
 
 ## Getting Started
 
-1. Fork the repository.M
+1. Fork the repository.
 2. Create a branch for your change.
 3. Make your changes.
 4. Run the tests.

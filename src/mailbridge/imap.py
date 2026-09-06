@@ -64,10 +64,6 @@ class RawMessage:
     uid: int
     raw: bytes
 
-    @property
-    def size(self) -> int:
-        return len(self.raw)
-
 
 @contextmanager
 def connect(config: Config) -> Iterator[MailboxClient]:
@@ -171,9 +167,11 @@ def idle(
     should_stop: Callable[[], bool] = lambda: False,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> bool:
-    """Wait for the server to report new mail. True means something arrived.
+    """Wait until there is a reason to re-check the mailbox.
 
-    Returns False on a clean timeout or a shutdown request; both mean "loop again".
+    True means the server reported activity, False that the wait ended on its own.
+    Both leave the caller in the same place: fetch again. The polling fallback has
+    no way to tell the difference and always reports True.
     """
     if not _supports_idle(client):
         return _poll_instead(

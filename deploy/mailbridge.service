@@ -1,13 +1,5 @@
-# Example systemd unit. Copy to /etc/systemd/system/mailbridge.service and
-# adjust the paths, then:
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now mailbridge
-#
-# Assumes a dedicated service account and layout:
-#   sudo useradd --system --home /opt/mailbridge --shell /usr/sbin/nologin mailbridge
-#   sudo install -d -o mailbridge -g mailbridge -m 0750 /opt/mailbridge /var/lib/mailbridge
-#   sudo install -o mailbridge -g mailbridge -m 0600 .env /etc/mailbridge.env
-# See docs/deployment.md for the full walkthrough.
+# Example unit. The paths below assume the layout in docs/deployment.md, which
+# has the service-account and credential-file setup this expects.
 
 [Unit]
 Description=Mail.ru to Telegram bridge

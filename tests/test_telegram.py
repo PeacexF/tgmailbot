@@ -12,7 +12,6 @@ import pytest
 from mailbridge.config import Secret
 from mailbridge.parser import Attachment, Email
 from mailbridge.telegram import (
-    CAPTION_LIMIT,
     MAX_MESSAGE_LENGTH,
     MAX_UPLOAD_BYTES,
     MIN_SEND_INTERVAL,
@@ -387,30 +386,6 @@ class TestSendDocument:
             client.send_document("a.pdf", b"data", "application/pdf")
 
         assert CHAT_ID.encode() in seen[0].content
-
-    def test_a_caption_is_included_when_given(self) -> None:
-        client, seen = make_client(ok({"message_id": 1}))
-
-        with client:
-            client.send_document("a.pdf", b"data", "application/pdf", caption="hello")
-
-        assert b"hello" in seen[0].content
-
-    def test_no_caption_field_when_empty(self) -> None:
-        client, seen = make_client(ok({"message_id": 1}))
-
-        with client:
-            client.send_document("a.pdf", b"data", "application/pdf")
-
-        assert b'name="caption"' not in seen[0].content
-
-    def test_a_long_caption_is_truncated(self) -> None:
-        client, seen = make_client(ok({"message_id": 1}))
-
-        with client:
-            client.send_document("a.pdf", b"d", "application/pdf", caption="x" * 2000)
-
-        assert seen[0].content.count(b"x") == CAPTION_LIMIT
 
     def test_an_oversized_upload_is_refused_without_a_request(self) -> None:
         client, seen = make_client(ok({"message_id": 1}))

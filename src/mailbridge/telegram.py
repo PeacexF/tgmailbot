@@ -25,7 +25,6 @@ PARSE_MODE: Final = "HTML"
 # The cloud Bot API accepts uploads up to 50 MB; only a self-hosted API server
 # raises that. Anything larger is reported in the message instead of uploaded.
 MAX_UPLOAD_BYTES: Final = 50 * 1024 * 1024
-CAPTION_LIMIT: Final = 1024
 
 TOO_MANY_REQUESTS: Final = 429
 SERVER_ERROR: Final = 500
@@ -109,11 +108,8 @@ class TelegramClient:
         if not text.strip():
             raise TelegramError("refusing to send an empty message")
         if len(text) > MAX_MESSAGE_LENGTH:
-            logger.warning(
-                "truncating a %d character message to %d; splitting arrives in Phase 2",
-                len(text),
-                MAX_MESSAGE_LENGTH,
-            )
+            # send_text is the splitting entry point; this only guards direct callers.
+            logger.warning("truncating a %d character message", len(text))
             text = text[:MAX_MESSAGE_LENGTH]
 
         result = self._post(
@@ -134,23 +130,16 @@ class TelegramClient:
         """Send text as however many messages Telegram's size limit requires."""
         return [self.send_message(chunk) for chunk in split_text(text)]
 
-    def send_document(
-        self, filename: str, content: bytes, content_type: str, caption: str = ""
-    ) -> int:
+    def send_document(self, filename: str, content: bytes, content_type: str) -> int:
         if len(content) > MAX_UPLOAD_BYTES:
             raise TelegramError(
                 f"{filename} is {format_size(len(content))}, above the"
                 f" {format_size(MAX_UPLOAD_BYTES)} upload limit"
             )
 
-        data = {"chat_id": self._chat_id}
-        if caption:
-            data["caption"] = caption[:CAPTION_LIMIT]
-            data["parse_mode"] = PARSE_MODE
-
         result = self._request(
             "sendDocument",
-            data=data,
+            data={"chat_id": self._chat_id},
             files={"document": (filename, content, content_type)},
         )
         message_id = result.get("message_id")

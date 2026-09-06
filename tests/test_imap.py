@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from mailbridge.imap import ImapError, RawMessage, fetch_new, idle, open_folder, search_new
+from mailbridge.imap import ImapError, fetch_new, idle, open_folder, search_new
 
 BODY_KEY = b"BODY[]"
 
@@ -88,11 +88,6 @@ class FakeClient:
 
     def logout(self) -> Any:
         return b"BYE"
-
-
-class TestRawMessage:
-    def test_size_is_the_byte_length(self) -> None:
-        assert RawMessage(uid=1, raw=b"12345").size == 5
 
 
 class TestFetchUnseen:

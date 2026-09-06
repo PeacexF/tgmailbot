@@ -1,5 +1,5 @@
-# Keep the build context to what the image actually needs. Everything is
-# excluded first so a new file cannot silently reach a layer.
+# Deny first, then allow: a file added to the repo later cannot reach a layer
+# without being named here.
 *
 
 !pyproject.toml
@@ -7,8 +7,7 @@
 !README.md
 !src/
 
-# Belt and braces: never let credentials or local state into an image layer,
-# even if the allowlist above widens later.
+# Redundant against the allowlist above, kept so widening it stays safe.
 **/.env
 **/.env.*
 **/*.db
